@@ -3,7 +3,7 @@ name: IMA Studio Music Generation
 version: 1.1.0
 category: file-generation
 author: IMA Studio (imastudio.com)
-keywords: imastudio, music generation, ai music
+keywords: imastudio, music generation, ai music, 音乐生成, AI音乐, 作曲, IMA, BGM, 背景音乐, Suno, DouBao
 argument-hint: "[music description or lyrics]"
 description: >
   Top-tier AI music generation featuring latest models including Suno sonic v5, DouBao BGM, and 

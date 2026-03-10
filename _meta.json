@@ -1,6 +1,8 @@
 {
   "ownerid": "kn70cjr952qdec1nx70zs6wefn7ynq2t",
   "slug": "ima-voice-ai",
+  "name": "IMA Studio Music Generation",
+  "description": "IMA 音乐生成：Suno sonic、DouBao BGM/Song，文本作曲、BGM、人声。Music gen via Suno, DouBao.",
   "version": "1.1.0",
   "publishedAt": 1741277713337
 }
