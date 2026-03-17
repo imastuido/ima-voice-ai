@@ -18,6 +18,7 @@ Logs: ~/.openclaw/logs/ima_skills/ima_create_YYYYMMDD.log
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -52,7 +53,7 @@ TASK_TYPE        = "text_to_music"  # Fixed task type for voice/music generation
 # Poll configuration for music generation
 POLL_CONFIG = {
     "interval": 5,
-    "max_wait": 300,  # Increased for Suno (slow generation, 120-180s typical)
+    "max_wait": 480,  # 8-minute cap for text_to_music polling
 }
 
 
@@ -716,52 +717,145 @@ def create_task_with_reflection(base_url: str, api_key: str, model_params: dict,
     return None, reflection
 
 
+def extract_error_info(exception: Exception) -> dict:
+    error_str = str(exception)
+    if isinstance(exception, TimeoutError):
+        return {"code": "timeout", "message": error_str, "type": "timeout"}
+    code_match = re.search(r'code[=:]?\s*(\d+)', error_str, re.IGNORECASE)
+    if code_match:
+        code = int(code_match.group(1))
+        return {"code": code, "message": error_str, "type": f"api_{code}"}
+    return {"code": "unknown", "message": error_str, "type": "unknown"}
+
+
+def build_contextual_diagnosis(error_info: dict,
+                               model_params: dict,
+                               current_params: dict | None,
+                               reflection: ReflectionLog | None = None) -> dict:
+    code = error_info.get("code")
+    raw_message = str(error_info.get("message") or "")
+    msg_lower = raw_message.lower()
+    model_name = model_params.get("model_name") or "unknown_model"
+    model_id = model_params.get("model_id") or "unknown_model_id"
+    current_params = current_params or {}
+
+    removed_params: list[str] = []
+    attempts = 0
+    if reflection and reflection.attempts:
+        attempts = len(reflection.attempts)
+        for a in reflection.attempts:
+            removed_params.extend(a.get("removed_params", []))
+    removed_params = sorted(set(removed_params))
+
+    diagnosis = {
+        "code": code,
+        "confidence": "medium",
+        "headline": "Music generation failed with current model configuration",
+        "reasoning": [],
+        "actions": [],
+        "model_name": model_name,
+        "model_id": model_id,
+        "task_type": TASK_TYPE,
+        "attempts": attempts,
+    }
+
+    if code == 401 or "unauthorized" in msg_lower:
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "API key is invalid or unauthorized"
+        diagnosis["actions"].append("Regenerate API key: https://www.imaclaw.ai/imaclaw/apikey")
+        diagnosis["actions"].append("Retry with the new key in --api-key.")
+        return diagnosis
+
+    if code == 4008 or "insufficient points" in msg_lower:
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "Account points are not enough for this music request"
+        diagnosis["actions"].append("Top up credits: https://www.imaclaw.ai/imaclaw/subscription")
+        diagnosis["actions"].append("Or switch to a lower-cost model.")
+        return diagnosis
+
+    if code in (6009, 6010) or "attribute" in msg_lower or removed_params:
+        diagnosis["confidence"] = "high" if code in (6009, 6010) else "medium"
+        diagnosis["headline"] = "Current parameter set does not match this music model rules"
+        if removed_params:
+            diagnosis["reasoning"].append("Unsupported params observed in retries: " + ", ".join(removed_params[:6]))
+        if current_params:
+            preview = ", ".join(f"{k}={v}" for k, v in list(current_params.items())[:4])
+            diagnosis["reasoning"].append("Last attempted params: " + preview)
+        diagnosis["actions"].append("Remove custom params and retry with model defaults.")
+        diagnosis["actions"].append("Try another model via --list-models (e.g., sonic or GenBGM).")
+        return diagnosis
+
+    if code == "timeout" or "timed out" in msg_lower:
+        diagnosis["headline"] = "Music task exceeded polling timeout"
+        diagnosis["actions"].append("Retry with simpler prompt or default params.")
+        diagnosis["actions"].append("Check task status in dashboard: https://imagent.bot")
+        return diagnosis
+
+    if "lyrics" in msg_lower and ("format" in msg_lower or "invalid" in msg_lower):
+        diagnosis["confidence"] = "high"
+        diagnosis["headline"] = "Lyrics format is incompatible with current model requirements"
+        diagnosis["actions"].append("Simplify lyrics format or enable auto lyrics if supported.")
+        diagnosis["actions"].append("Retry with shorter structured prompt.")
+        return diagnosis
+
+    diagnosis["reasoning"].append(f"Model context: {model_name} ({model_id}), task={TASK_TYPE}.")
+    diagnosis["actions"].append("Retry with defaults and a simpler prompt.")
+    diagnosis["actions"].append("If repeated, switch model via --list-models.")
+    return diagnosis
+
+
+def format_user_failure_message(diagnosis: dict,
+                                attempts_used: int,
+                                max_attempts: int) -> str:
+    lines = [
+        f"Music task failed after {attempts_used}/{max_attempts} attempt(s).",
+        f"Model: {diagnosis.get('model_name')} ({diagnosis.get('model_id')})",
+        f"Likely cause ({diagnosis.get('confidence', 'medium')} confidence): {diagnosis.get('headline')}",
+    ]
+    reasoning = diagnosis.get("reasoning") or []
+    if reasoning:
+        lines.append("Why this diagnosis:")
+        for item in reasoning[:3]:
+            lines.append(f"- {item}")
+    actions = diagnosis.get("actions") or []
+    if actions:
+        lines.append("What to do next:")
+        for i, action in enumerate(actions[:4], 1):
+            lines.append(f"{i}. {action}")
+    code = diagnosis.get("code")
+    if code not in (None, "", "unknown"):
+        lines.append(f"Reference code: {code}")
+    lines.append("Technical details were recorded in local logs.")
+    return "\n".join(lines)
+
+
 def generate_user_suggestion(reflection: ReflectionLog, model_params: dict) -> str:
-    """
-    Generate user-friendly error message from reflection log.
-    
-    Shows what went wrong and suggests alternative models/parameters.
-    """
     if not reflection.attempts:
-        return "❌ 音频生成失败：未知错误"
-    
-    last_attempt = reflection.attempts[-1]
-    error_code = last_attempt.get("error_code")
-    removed_params = []
-    
-    # Collect all removed params across attempts
-    for attempt in reflection.attempts:
-        removed_params.extend(attempt.get("removed_params", []))
-    
-    removed_params = list(set(removed_params))  # Deduplicate
-    
-    msg_parts = ["❌ 音频生成失败"]
-    msg_parts.append(f"\n• 尝试次数: {len(reflection.attempts)}")
-    msg_parts.append(f"\n• 模型: {model_params['model_name']}")
-    
-    if removed_params:
-        msg_parts.append(f"\n• 不支持的参数: {', '.join(removed_params)}")
-    
-    if error_code == 6009:
-        msg_parts.append("\n\n❓ 原因: 模型不支持当前参数组合")
-        msg_parts.append("\n💡 建议:")
-        msg_parts.append("\n  1. 尝试其他模型（推荐: Suno sonic, DouBao GenBGM）")
-        msg_parts.append("\n  2. 移除不支持的参数")
-    elif error_code == 6010:
-        msg_parts.append("\n\n❓ 原因: 参数配置与模型不匹配")
-        msg_parts.append("\n💡 建议:")
-        msg_parts.append("\n  1. 使用模型的默认参数")
-        msg_parts.append("\n  2. 尝试其他模型")
-    else:
-        msg_parts.append("\n\n❓ 原因: 生成参数配置异常")
-        msg_parts.append("\n💡 建议: 换个模型试试（推荐: Suno sonic）")
-    
-    # Add reflection log (condensed)
-    msg_parts.append("\n\n📝 反省日志:")
-    for attempt in reflection.attempts:
-        msg_parts.append(f"\n  [{attempt['attempt']}] {attempt['reflection']}")
-    
-    return "".join(msg_parts)
+        diagnosis = build_contextual_diagnosis(
+            {"code": "unknown", "message": "unknown", "type": "unknown"},
+            model_params,
+            {},
+            reflection,
+        )
+        return format_user_failure_message(diagnosis, 1, 3)
+    last = reflection.attempts[-1]
+    error_code = last.get("error_code")
+    error_info = {
+        "code": error_code if error_code is not None else "unknown",
+        "message": last.get("reflection", ""),
+        "type": f"api_{error_code}" if error_code is not None else "unknown",
+    }
+    diagnosis = build_contextual_diagnosis(
+        error_info=error_info,
+        model_params=model_params,
+        current_params=last.get("sent_params") or {},
+        reflection=reflection,
+    )
+    return format_user_failure_message(
+        diagnosis,
+        attempts_used=len(reflection.attempts),
+        max_attempts=max(3, len(reflection.attempts)),
+    )
 
 
 # ─── Step 3: Create Task (Legacy Wrapper) ─────────────────────────────────────
@@ -954,11 +1048,12 @@ def main():
         )
         
         # Show reflection log if there were retries
-        if len(reflection.attempts) > 1:
+        if task_id and len(reflection.attempts) > 1:
             print(f"\n🧠 反省日志 ({len(reflection.attempts)} 次尝试):")
             for attempt in reflection.attempts:
                 status = "✅" if attempt.get("error_code") is None else "❌"
-                print(f"   {status} [尝试 {attempt['attempt']}] {attempt['reflection']}")
+                action = attempt.get("action_taken") or "retry"
+                print(f"   {status} [尝试 {attempt['attempt']}] action={action}")
         
         if not task_id:
             # Generate user suggestion
@@ -968,7 +1063,22 @@ def main():
         
     except RuntimeError as e:
         logger.error(f"Task creation failed: {str(e)}")
-        print(f"❌ Create task failed: {e}", file=sys.stderr)
+        create_error = extract_error_info(e)
+        diagnosis = build_contextual_diagnosis(
+            error_info=create_error,
+            model_params=mp,
+            current_params=extra if extra else {},
+            reflection=None,
+        )
+        print(
+            "❌ "
+            + format_user_failure_message(
+                diagnosis=diagnosis,
+                attempts_used=1,
+                max_attempts=1,
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print(f"✅ Task created: {task_id}", flush=True)
@@ -982,7 +1092,22 @@ def main():
         media = poll_task(base, apikey, task_id, estimated_max=est_max)
     except (TimeoutError, RuntimeError) as e:
         logger.error(f"Task polling failed: {str(e)}")
-        print(f"\n❌ {e}", file=sys.stderr)
+        poll_error = extract_error_info(e)
+        diagnosis = build_contextual_diagnosis(
+            error_info=poll_error,
+            model_params=mp,
+            current_params=extra if extra else {},
+            reflection=None,
+        )
+        print(
+            "\n❌ "
+            + format_user_failure_message(
+                diagnosis=diagnosis,
+                attempts_used=1,
+                max_attempts=1,
+            ),
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── 6. Save preference ────────────────────────────────────────────────────
